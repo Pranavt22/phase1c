@@ -10,75 +10,137 @@
 #define CHECKKERNEL() \
     if ((USLOSS_PsrGet() & USLOSS_PSR_CURRENT_MODE) == 0) USLOSS_IllegalInstruction()
 
+#define FREE 0
+#define BUSY 1
 
-typedef struct Lock 
+typedef struct Lock
 {
-    char        name[P1_MAXNAME];
-    int         locked;
     int         inuse;
+    char        name[P1_MAXNAME];
+    int         state; // BUSY or FREE
+    int         pid;
+    int         lid;
+    int         queue[P1_MAXLOCKS];
+    int         queueSize;
     // more fields here
 } Lock;
 
 static Lock locks[P1_MAXLOCKS];
 
-void P1LockInit(void) 
-{
-    static int initialized = FALSE;
+void P1LockInit(void) {
     CHECKKERNEL();
-    if (!initialized) {
-        P1ProcInit();
-        for (int i = 0; i < P1_MAXLOCKS; i++) {
-            locks[i].inuse = FALSE;
-            // initialize rest of lock here
+    P1ProcInit();
+    for (int i = 0; i < P1_MAXLOCKS; i++) {
+        locks[i].inuse = FALSE;
+        locks[i].state = FREE;
+        locks[i].pid = -1;
+        locks[i].lid = i;
+        locks[i].queueSize = 0;
+    }
+    USLOSS_IntVec[USLOSS_ILLEGAL_INT] = IllegalInstructionHandler;
+}
+
+int P1_LockCreate(char *name, int *lid) {
+    int result = P1_SUCCESS;
+    CHECKKERNEL();
+    // disable interrupts
+    int enables = P1DisableInterrupts();
+    for (int i = 0; i < P1_MAXLOCKS; i++) {
+        if (strcmp(name, locks[i].name) == 0) {
+            return P1_DUPLICATE_NAME;
         }
     }
-    initialized = TRUE;
-}
-
-int P1_LockCreate(char *name, int *lid)
-{
-    int result = P1_SUCCESS;
-    CHECKKERNEL();
-    // disable interrupts
-    // check parameters
-    // find a free Lock and initialize it
-    // re-enable interrupts if they were previously enabled
+    if (name == NULL) {
+        return P1_NAME_IS_NULL;
+    }
+    if (strlen(name) > P1_MAXNAME) {
+        return P1_NAME_TOO_LONG;
+    }
+    int j = 0;
+    for (j = 0; j < P1_MAXLOCKS; j++) {
+        if (locks[j].inuse != TRUE) {
+            locks[j].inuse = TRUE;
+            locks[j].state = FREE;
+            locks[j].pid = -1;
+            locks[j].lid = j;
+            strcpy(locks[j].name, name);
+            break;
+        }
+    }
+    *lid = j;
+    if (j == P1_MAXLOCKS) {
+        return P1_TOO_MANY_LOCKS;
+    }
+    if (enables == TRUE) {
+        P1EnableInterrupts();
+    }
+    // find an unused Lock and initialize it
+    // restore interrupts
     return result;
 }
 
-int P1_LockFree(int lid) 
-{
+int P1_LockFree(int lid) {
     int     result = P1_SUCCESS;
     CHECKKERNEL();
-    // more code here
+    
+    // disable interrupts
+    P1DisableInterrupts();
+    // check if any processes are waiting on lock
+    // mark lock as unused and clean up any state
+    // restore interrupts
     return result;
 }
 
-int P1_Lock(int lid) 
-{
+int P1_Lock(int lid) {
     int result = P1_SUCCESS;
     CHECKKERNEL();
-    // disable interrupts
-    // check if current process already holds lock
-    // while lock is already held
-    //      set state to P1_STATE_BLOCKED
-    //      P1Dispatch(FALSE);
-    // record that lock is now held by this process
-    // re-enable interrupts if they were previously enabled
+
+    if (lid < 0 || lid >= P1_MAXLOCKS) {
+        result = P1_INVALID_LOCK;
+        return result;
+    }
+    int enables;
+    while (1) {
+        enables = P1DisableInterrupts();
+        if (locks[lid].state == FREE) {
+            locks[lid].state = BUSY; 
+            break;
+        }
+        int setStatus = P1SetState(P1_GetPid(), P1_STATE_BLOCKED, lid, -1);
+        
+    }
+
+    /*********************
+    Pseudo-code from the lecture notes.
+
+    while(1) {
+          DisableInterrupts();
+          if (lock->state == FREE) {
+              lock->state = BUSY;
+              break;
+          }
+          Mark process BLOCKED, add to lock->q
+          RestoreInterrupts();
+          Dispatcher();
+    }
+    RestoreInterrupts();
+    *********************/
+
     return result;
 }
 
-int P1_Unlock(int lid) 
-{
+int P1_Unlock(int lid) {
     int result = P1_SUCCESS;
     CHECKKERNEL();
-    // disable interrupts
-    // check if current process holds lock
-    // mark lock as unlocked
-    // if a process is waiting for this lock
-    //      set the process's state to P1_STATE_READY
-    //      P1Dispatch(FALSE);
-    // re-enable interrupts if they were previously enabled
+    /*********************
+      DisableInterrupts();
+      lock->state = FREE;
+      if (lock->q is not empty) {
+          Remove process from lock->q, mark READY
+          Dispatcher();
+      }
+      RestoreInterrupts();
+    *********************/
     return result;
 }
 
@@ -93,9 +155,21 @@ int P1_LockName(int lid, char *name, int len) {
  * Condition variable functions.
  */
 
+typedef struct Condition {
+    int         inuse;
+    char        name[P1_MAXNAME];
+    int         lock;  // lock associated with this variable
+    // more fields here
+} Condition;
+
+static Condition conditions[P1_MAXCONDS];
+
 void P1CondInit(void) {
     CHECKKERNEL();
-    // more code here
+    P1LockInit();
+    for (int i = 0; i < P1_MAXCONDS; i++) {
+        conditions[i].inuse = FALSE;
+    }
 }
 
 int P1_CondCreate(char *name, int lid, int *vid) {
@@ -112,24 +186,52 @@ int P1_CondFree(int vid) {
     return result;
 }
 
+
 int P1_Wait(int vid) {
     int result = P1_SUCCESS;
     CHECKKERNEL();
-    // more code here
+    /*********************
+      DisableInterrupts();
+      Confirm lock is held
+      cv->waiting++;
+      Release(cv->lock);
+      Make process BLOCKED, add to cv->q
+      Dispatcher();
+      Acquire(cv->lock);
+      RestoreInterrupts();
+    *********************/
     return result;
 }
 
 int P1_Signal(int vid) {
     int result = P1_SUCCESS;
-    CHECKKERNEL();
-    // more code here
+        CHECKKERNEL();
+    /*********************
+      DisableInterrupts();
+      Confirm lock is held
+      if (cv->waiting > 0) {
+        Remove process from cv->q, make READY
+        cv->waiting--;
+        Dispatcher();
+      }
+      RestoreInterrupts();
+    *********************/
     return result;
 }
 
 int P1_Broadcast(int vid) {
     int result = P1_SUCCESS;
     CHECKKERNEL();
-    // more code here
+    /*********************
+      DisableInterrupts();
+      Confirm lock is held
+      while (cv->waiting > 0) {
+        Remove process from cv->q, make READY
+        cv->waiting--;
+        Dispatcher();
+      }
+      RestoreInterrupts();
+    *********************/
     return result;
 }
 
@@ -146,3 +248,4 @@ int P1_CondName(int vid, char *name, int len) {
     // more code here
     return result;
 }
+
